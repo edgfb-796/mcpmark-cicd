@@ -1,0 +1,384 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          echo "## ESLint Results" > eslint-results.txt
+          npm run lint 2>&1 | tee -a eslint-results.txt || echo "ESLINT_FAILED=true" >> $GITHUB_ENV
+          echo "ESLINT_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Check Prettier formatting
+        id: prettier
+        run: |
+          echo "## Prettier Results" > prettier-results.txt
+          npx prettier --check "src/**/*.js" 2>&1 | tee -a prettier-results.txt || echo "PRETTIER_FAILED=true" >> $GITHUB_ENV
+          echo "PRETTIER_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Post Code Quality Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let eslintContent = '';
+            let prettierContent = '';
+            
+            try {
+              eslintContent = fs.readFileSync('eslint-results.txt', 'utf8');
+            } catch (e) {
+              eslintContent = 'ESLint results not available';
+            }
+            
+            try {
+              prettierContent = fs.readFileSync('prettier-results.txt', 'utf8');
+            } catch (e) {
+              prettierContent = 'Prettier results not available';
+            }
+            
+            const eslintStatus = process.env.ESLINT_FAILED === 'true' ? '❌ Failed' : '✅ Passed';
+            const prettierStatus = process.env.PRETTIER_FAILED === 'true' ? '❌ Failed' : '✅ Passed';
+            
+            const body = `## Code Quality Report
+n            
+            ### ESLint Status: ${eslintStatus}
+            \`\`\`
+            ${eslintContent.substring(0, 2000)}
+            \`\`\`
+            
+            ### Prettier Status: ${prettierStatus}
+            \`\`\`
+            ${prettierContent.substring(0, 2000)}
+            \`\`\`
+            
+            *Pushed at: ${new Date().toISOString()}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          echo "## Test Results" > test-results.txt
+          npm run test:coverage 2>&1 | tee -a test-results.txt || echo "TESTS_FAILED=true" >> $GITHUB_ENV
+          echo "TESTS_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            test-results.txt
+          retention-days: 7
+
+      - name: Extract coverage summary
+        if: always()
+        run: |
+          if [ -f "coverage/coverage-summary.json" ]; then
+            echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_ENV
+            cat coverage/coverage-summary.json >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            echo "COVERAGE_SUMMARY={}" >> $GITHUB_ENV
+          fi
+
+      - name: Post Test Coverage Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let testContent = '';
+            try {
+              testContent = fs.readFileSync('test-results.txt', 'utf8');
+            } catch (e) {
+              testContent = 'Test results not available';
+            }
+            
+            const testsStatus = process.env.TESTS_FAILED === 'true' ? '❌ Failed' : '✅ Passed';
+            
+            let coverageInfo = '';
+            try {
+              const coverageData = JSON.parse(process.env.COVERAGE_SUMMARY || '{}');
+              if (coverageData.total) {
+                const total = coverageData.total;
+                coverageInfo = `
+                **Coverage Summary:**
+                - Statements: ${total.statements?.pct || 0}%
+                - Branches: ${total.branches?.pct || 0}%
+                - Functions: ${total.functions?.pct || 0}%
+                - Lines: ${total.lines?.pct || 0}%
+                `;
+              }
+            } catch (e) {
+              coverageInfo = 'Coverage data not available';
+            }
+            
+            const body = `## Test Coverage Report
+            
+            ### Test Status: ${testsStatus}
+            
+            ${coverageInfo}
+            
+            ### Detailed Results
+            \`\`\`
+            ${testContent.substring(0, 1500)}
+            \`\`\`
+            
+            *Pushed at: ${new Date().toISOString()}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: audit
+        run: |
+          echo "## Security Audit Results" > audit-results.txt
+          npm audit --audit-level=moderate 2>&1 | tee -a audit-results.txt || echo "AUDIT_FAILED=true" >> $GITHUB_ENV
+          echo "AUDIT_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Scan for secrets in changes
+        id: secrets
+        run: |
+          echo "## Secret Scan Results" > secret-results.txt
+          git diff HEAD~1..HEAD --name-only | while read file; do
+            if [ -f "$file" ]; then
+              echo "Scanning $file for secrets..." >> secret-results.txt
+              grep -i -E "(password|secret|key|token|api[_-]key|access[_-]token|private[_-]key)" "$file" >> secret-results.txt 2>/dev/null || true
+            fi
+          done
+          echo "Secret scanning completed" >> secret-results.txt
+
+      - name: Post Security Scan Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let auditContent = '';
+            let secretContent = '';
+            
+            try {
+              auditContent = fs.readFileSync('audit-results.txt', 'utf8');
+            } catch (e) {
+              auditContent = 'Audit results not available';
+            }
+            
+            try {
+              secretContent = fs.readFileSync('secret-results.txt', 'utf8');
+            } catch (e) {
+              secretContent = 'Secret scan results not available';
+            }
+            
+            const auditStatus = process.env.AUDIT_FAILED === 'true' ? '⚠️ Vulnerabilities found' : '✅ No critical vulnerabilities';
+            
+            const body = `## Security Scan Report
+            
+            ### Dependencies Vulnerabilities: ${auditStatus}
+            
+            #### npm audit results:
+            \`\`\`
+            ${auditContent.substring(0, 1500)}
+            \`\`\`
+            
+            #### Secret Scan Results:
+            \`\`\`
+            ${secretContent.substring(0, 1000)}
+            \`\`\`
+            
+            *Pushed at: ${new Date().toISOString()}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          echo "## Build Results" > build-results.txt
+          npm run build 2>&1 | tee -a build-results.txt || echo "BUILD_FAILED=true" >> $GITHUB_ENV
+          echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Start application for validation
+        id: start-app
+        run: |
+          echo "## Application Startup" > startup-results.txt
+          npm start &
+          APP_PID=$!
+          echo "App started with PID: $APP_PID" >> startup-results.txt
+          
+          # Wait for app to start
+          sleep 5
+          
+          # Test health endpoint
+          echo "Testing health endpoint..." >> startup-results.txt
+          curl -f http://localhost:3000/health >> startup-results.txt 2>&1 || echo "HEALTH_CHECK_FAILED=true" >> $GITHUB_ENV
+          
+          # Kill the app
+          kill $APP_PID 2>/dev/null || true
+          wait $APP_PID 2>/dev/null || true
+          
+          echo "Application validation completed" >> startup-results.txt
+
+      - name: Create deployment preview artifacts
+        if: always()
+        run: |
+          mkdir -p deployment-preview
+          echo "Build Date: $(date)" > deployment-preview/build-info.txt
+          echo "Commit: ${{ github.sha }}" >> deployment-preview/build-info.txt
+          echo "PR: #${{ github.event.pull_request.number }}" >> deployment-preview/build-info.txt
+          echo "Branch: ${{ github.head_ref }}" >> deployment-preview/build-info.txt
+
+      - name: Upload deployment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: deployment-preview/
+          retention-days: 7
+
+      - name: Post Build Validation Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let buildContent = '';
+            let startupContent = '';
+            
+            try {
+              buildContent = fs.readFileSync('build-results.txt', 'utf8');
+            } catch (e) {
+              buildContent = 'Build results not available';
+            }
+            
+            try {
+              startupContent = fs.readFileSync('startup-results.txt', 'utf8');
+            } catch (e) {
+              startupContent = 'Startup results not available';
+            }
+            
+            const buildStatus = process.env.BUILD_FAILED === 'true' ? '❌ Failed' : '✅ Passed';
+            const healthStatus = process.env.HEALTH_CHECK_FAILED === 'true' ? '❌ Failed' : '✅ Passed';
+            
+            const body = `## Build Validation
+            
+            ### Build Status: ${buildStatus}
+            
+            ### Health Check: ${healthStatus}
+            
+            #### Build Output:
+            \`\`\`
+            ${buildContent.substring(0, 1500)}
+            \`\`\`
+            
+            #### Application Startup:
+            \`\`\`
+            ${startupContent.substring(0, 1000)}
+            \`\`\`
+            
+            *Pushed at: ${new Date().toISOString()}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
